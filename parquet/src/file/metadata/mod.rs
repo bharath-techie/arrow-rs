@@ -189,8 +189,15 @@ pub type ParquetOffsetIndex = Vec<Vec<OffsetIndexMetaData>>;
 pub struct ParquetMetaData {
     /// File level metadata
     file_metadata: FileMetaData,
-    /// Row group metadata
-    row_groups: Vec<RowGroupMetaData>,
+    /// Row group metadata.
+    ///
+    /// Stored behind an `Arc` so that cloning `ParquetMetaData` (e.g. to graft a
+    /// separately-loaded page index onto an already-decoded, shared footer) does
+    /// not deep-copy every `RowGroupMetaData` / `ColumnChunkMetaData`. On wide,
+    /// many-row-group files that deep copy dominates the clone cost; sharing makes
+    /// it a refcount bump. The public API is unchanged: constructors still take a
+    /// `Vec`, and `row_groups()` still yields `&[RowGroupMetaData]`.
+    row_groups: Arc<Vec<RowGroupMetaData>>,
     /// Page level index for each page in each column chunk
     column_index: Option<ParquetColumnIndex>,
     /// Offset index for each page in each column chunk
@@ -206,7 +213,7 @@ impl ParquetMetaData {
     pub fn new(file_metadata: FileMetaData, row_groups: Vec<RowGroupMetaData>) -> Self {
         ParquetMetaData {
             file_metadata,
-            row_groups,
+            row_groups: Arc::new(row_groups),
             column_index: None,
             offset_index: None,
             #[cfg(feature = "encryption")]
@@ -364,13 +371,15 @@ impl ParquetMetaDataBuilder {
 
     /// Adds a row group to the metadata
     pub fn add_row_group(mut self, row_group: RowGroupMetaData) -> Self {
-        self.0.row_groups.push(row_group);
+        // `row_groups` is shared behind an `Arc`; `make_mut` clones only if this
+        // builder isn't the sole owner (it is, in the normal build path).
+        Arc::make_mut(&mut self.0.row_groups).push(row_group);
         self
     }
 
     /// Sets all the row groups to the specified list
     pub fn set_row_groups(mut self, row_groups: Vec<RowGroupMetaData>) -> Self {
-        self.0.row_groups = row_groups;
+        self.0.row_groups = Arc::new(row_groups);
         self
     }
 
@@ -380,7 +389,8 @@ impl ParquetMetaDataBuilder {
     /// This can be used for more efficient creation of a new ParquetMetaData
     /// from an existing one.
     pub fn take_row_groups(&mut self) -> Vec<RowGroupMetaData> {
-        std::mem::take(&mut self.0.row_groups)
+        // Reclaim the Vec without copying when uniquely owned; otherwise clone.
+        Arc::unwrap_or_clone(std::mem::take(&mut self.0.row_groups))
     }
 
     /// Return a reference to the current row groups
@@ -2034,9 +2044,9 @@ mod tests {
             .build();
 
         #[cfg(not(feature = "encryption"))]
-        let base_expected_size = 2766;
+        let base_expected_size = 2790;
         #[cfg(feature = "encryption")]
-        let base_expected_size = 2934;
+        let base_expected_size = 2958;
 
         assert_eq!(parquet_meta.memory_size(), base_expected_size);
 
@@ -2065,13 +2075,57 @@ mod tests {
             .build();
 
         #[cfg(not(feature = "encryption"))]
-        let bigger_expected_size = 3192;
+        let bigger_expected_size = 3216;
         #[cfg(feature = "encryption")]
-        let bigger_expected_size = 3360;
+        let bigger_expected_size = 3384;
 
         // more set fields means more memory usage
         assert!(bigger_expected_size > base_expected_size);
         assert_eq!(parquet_meta.memory_size(), bigger_expected_size);
+    }
+
+    /// `row_groups` is stored behind an `Arc`, so cloning `ParquetMetaData`
+    /// shares the row-group metadata instead of deep-copying every
+    /// `RowGroupMetaData` / `ColumnChunkMetaData`. This is a meaningful win when
+    /// grafting a page index onto a large, shared footer (wide schemas with many
+    /// row groups). Guard the invariant so a refactor back to an owned `Vec`
+    /// doesn't silently reintroduce the deep copy.
+    #[test]
+    fn test_clone_shares_row_groups() {
+        let schema_descr = get_test_schema_descr();
+        let columns = schema_descr
+            .columns()
+            .iter()
+            .map(|c| ColumnChunkMetaData::builder(c.clone()).build())
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let rg = RowGroupMetaData::builder(schema_descr.clone())
+            .set_num_rows(1000)
+            .set_column_metadata(columns)
+            .build()
+            .unwrap();
+        let file_metadata = FileMetaData::new(2, 1000, None, None, schema_descr, None);
+        let meta = ParquetMetaDataBuilder::new(file_metadata)
+            .set_row_groups(vec![rg])
+            .build();
+
+        let cloned = meta.clone();
+
+        // Public API is unchanged and yields identical data either way.
+        assert_eq!(meta.num_row_groups(), cloned.num_row_groups());
+        assert_eq!(meta.row_groups(), cloned.row_groups());
+        assert_eq!(meta.row_group(0).num_rows(), cloned.row_group(0).num_rows());
+
+        // The clone SHARES the row-group allocation rather than deep-copying it:
+        // both metadata instances' `row_groups()` slices point at the same backing
+        // buffer. (If `row_groups` were an owned `Vec`, clone would allocate a new
+        // buffer at a different address.)
+        let orig_ptr = meta.row_groups().as_ptr();
+        let clone_ptr = cloned.row_groups().as_ptr();
+        assert_eq!(
+            orig_ptr, clone_ptr,
+            "clone must share the row_groups allocation (Arc), not deep-copy it"
+        );
     }
 
     #[test]

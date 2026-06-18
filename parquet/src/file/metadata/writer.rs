@@ -447,7 +447,10 @@ impl<'a, W: Write> ParquetMetaDataWriter<'a, W> {
         let schema_descr = Arc::new(SchemaDescriptor::new(schema.clone()));
         let created_by = file_metadata.created_by().map(str::to_string);
 
-        let row_groups = self.metadata.row_groups.clone();
+        // `row_groups` is now `Arc<Vec<..>>`; the thrift writer needs an owned
+        // `Vec`. This is the (cold) serialization path, so cloning the inner Vec
+        // here is fine and preserves prior behavior.
+        let row_groups = (*self.metadata.row_groups).clone();
 
         let key_value_metadata = file_metadata.key_value_metadata().cloned();
 
