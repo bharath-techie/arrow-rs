@@ -470,6 +470,11 @@ impl ReadPlan {
     pub fn batch_size(&self) -> usize {
         self.batch_size
     }
+
+    /// Set the number of rows to read in the next output batch.
+    pub(crate) fn set_batch_size(&mut self, batch_size: usize) {
+        self.batch_size = batch_size;
+    }
 }
 
 #[cfg(test)]
