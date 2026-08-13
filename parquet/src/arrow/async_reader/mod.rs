@@ -663,6 +663,7 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
             offset,
             metrics,
             max_predicate_cache_size,
+            page_index_provider,
         } = self;
 
         // Ensure schema of ParquetRecordBatchStream respects projection, and does
@@ -688,6 +689,7 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
             offset,
             metrics,
             max_predicate_cache_size,
+            page_index_provider,
         }
         .build()?;
 

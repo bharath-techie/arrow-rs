@@ -48,6 +48,7 @@ use crate::file::metadata::{
     PageIndexPolicy, ParquetMetaData, ParquetMetaDataOptions, ParquetMetaDataReader,
     ParquetStatisticsPolicy, RowGroupMetaData,
 };
+use crate::file::page_index::provider::PageIndexProvider;
 use crate::file::reader::{ChunkReader, SerializedPageReader};
 use crate::schema::types::SchemaDescriptor;
 
@@ -147,6 +148,9 @@ pub struct ArrowReaderBuilder<T> {
     pub(crate) metrics: ArrowReaderMetrics,
 
     pub(crate) max_predicate_cache_size: usize,
+
+    /// Source of page indexes for the readers; defaults to the metadata itself.
+    pub(crate) page_index_provider: Arc<dyn PageIndexProvider>,
 }
 
 impl<T: Debug> Debug for ArrowReaderBuilder<T> {
@@ -165,12 +169,14 @@ impl<T: Debug> Debug for ArrowReaderBuilder<T> {
             .field("limit", &self.limit)
             .field("offset", &self.offset)
             .field("metrics", &self.metrics)
+            .field("page_index_provider", &self.page_index_provider)
             .finish()
     }
 }
 
 impl<T> ArrowReaderBuilder<T> {
     pub(crate) fn new_builder(input: T, metadata: ArrowReaderMetadata) -> Self {
+        let page_index_provider = metadata.page_index_provider();
         Self {
             input,
             metadata: metadata.metadata,
@@ -186,6 +192,7 @@ impl<T> ArrowReaderBuilder<T> {
             offset: None,
             metrics: ArrowReaderMetrics::Disabled,
             max_predicate_cache_size: 100 * 1024 * 1024, // 100MB default cache size
+            page_index_provider,
         }
     }
 
@@ -874,6 +881,9 @@ pub struct ArrowReaderMetadata {
     pub(crate) schema: SchemaRef,
     /// The Parquet schema (root field)
     pub(crate) fields: Option<Arc<ParquetField>>,
+    /// Optional custom source of page indexes. `None` means page indexes
+    /// are read from `metadata` itself. See [`Self::with_page_index_provider`].
+    pub(crate) page_index_provider: Option<Arc<dyn PageIndexProvider>>,
 }
 
 impl ArrowReaderMetadata {
@@ -934,6 +944,7 @@ impl ArrowReaderMetadata {
                     metadata,
                     schema: Arc::new(schema),
                     fields: fields.map(Arc::new),
+                    page_index_provider: None,
                 })
             }
         }
@@ -1006,7 +1017,35 @@ impl ArrowReaderMetadata {
             metadata,
             schema: supplied_schema,
             fields: field_levels.levels.map(Arc::new),
+            page_index_provider: None,
         })
+    }
+
+    /// Specify a custom [`PageIndexProvider`] as the source of page indexes
+    /// for readers built from this metadata.
+    ///
+    /// By default, readers obtain page indexes (used, for example, to locate
+    /// data pages when applying a [`RowSelection`]) from the embedded
+    /// [`ParquetMetaData`]. A custom provider allows page indexes to be
+    /// supplied out of band — for example from a cache of individually
+    /// decoded entries — without attaching them to the (potentially shared)
+    /// `ParquetMetaData`, and therefore without cloning or rebuilding it.
+    ///
+    /// Entries the provider does not supply are read without page-index
+    /// optimizations.
+    pub fn with_page_index_provider(mut self, provider: Arc<dyn PageIndexProvider>) -> Self {
+        self.page_index_provider = Some(provider);
+        self
+    }
+
+    /// Returns the source of page indexes for readers built from this
+    /// metadata: the custom provider if one was set, otherwise the embedded
+    /// [`ParquetMetaData`].
+    pub fn page_index_provider(&self) -> Arc<dyn PageIndexProvider> {
+        match &self.page_index_provider {
+            Some(provider) => Arc::clone(provider),
+            None => Arc::clone(&self.metadata) as Arc<dyn PageIndexProvider>,
+        }
     }
 
     /// Returns a reference to the [`ParquetMetaData`] for this parquet file
@@ -1209,6 +1248,7 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
             metrics,
             // Not used for the sync reader, see https://github.com/apache/arrow-rs/issues/8000
             max_predicate_cache_size: _,
+            page_index_provider,
         } = self;
 
         // Try to avoid allocate large buffer
@@ -1220,6 +1260,7 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
             reader: Arc::new(input.0),
             metadata,
             row_groups,
+            page_index_provider,
         };
 
         let mut plan_builder = ReadPlanBuilder::new(batch_size)
@@ -1268,6 +1309,8 @@ struct ReaderRowGroups<T: ChunkReader> {
     metadata: Arc<ParquetMetaData>,
     /// Optional list of row group indices to scan
     row_groups: Vec<usize>,
+    /// Source of page indexes (the metadata itself unless overridden)
+    page_index_provider: Arc<dyn PageIndexProvider>,
 }
 
 impl<T: ChunkReader + 'static> RowGroups for ReaderRowGroups<T> {
@@ -1285,6 +1328,7 @@ impl<T: ChunkReader + 'static> RowGroups for ReaderRowGroups<T> {
             reader: self.reader.clone(),
             metadata: self.metadata.clone(),
             row_groups: self.row_groups.clone().into_iter(),
+            page_index_provider: Arc::clone(&self.page_index_provider),
         }))
     }
 
@@ -1306,6 +1350,7 @@ struct ReaderPageIterator<T: ChunkReader> {
     column_idx: usize,
     row_groups: std::vec::IntoIter<usize>,
     metadata: Arc<ParquetMetaData>,
+    page_index_provider: Arc<dyn PageIndexProvider>,
 }
 
 impl<T: ChunkReader + 'static> ReaderPageIterator<T> {
@@ -1313,12 +1358,12 @@ impl<T: ChunkReader + 'static> ReaderPageIterator<T> {
     fn next_page_reader(&mut self, rg_idx: usize) -> Result<SerializedPageReader<T>> {
         let rg = self.metadata.row_group(rg_idx);
         let column_chunk_metadata = rg.column(self.column_idx);
-        let offset_index = self.metadata.offset_index();
-        // `offset_index` may not exist and `i[rg_idx]` will be empty.
-        // To avoid `i[rg_idx][self.column_idx`] panic, we need to filter out empty `i[rg_idx]`.
-        let page_locations = offset_index
-            .filter(|i| !i[rg_idx].is_empty())
-            .map(|i| i[rg_idx][self.column_idx].page_locations.clone());
+        // A missing entry simply disables page-location optimizations for
+        // this column chunk.
+        let page_locations = self
+            .page_index_provider
+            .offset_index(rg_idx, self.column_idx)
+            .map(|i| i.page_locations.clone());
         let total_rows = rg.num_rows() as usize;
         let reader = self.reader.clone();
 

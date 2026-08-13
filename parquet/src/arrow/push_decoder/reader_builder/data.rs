@@ -22,7 +22,7 @@ use crate::arrow::arrow_reader::RowSelection;
 use crate::arrow::in_memory_row_group::{ColumnChunkData, FetchRanges, InMemoryRowGroup};
 use crate::errors::ParquetError;
 use crate::file::metadata::ParquetMetaData;
-use crate::file::page_index::offset_index::OffsetIndexMetaData;
+use crate::file::page_index::provider::PageIndexProvider;
 use crate::file::reader::ChunkReader;
 use crate::util::push_buffers::PushBuffers;
 use bytes::Bytes;
@@ -81,6 +81,7 @@ impl DataRequest {
         row_group_idx: usize,
         row_count: usize,
         parquet_metadata: &'a ParquetMetaData,
+        page_index_provider: &'a dyn PageIndexProvider,
         projection: &ProjectionMask,
         buffers: &mut PushBuffers,
     ) -> Result<InMemoryRowGroup<'a>, ParquetError> {
@@ -98,7 +99,7 @@ impl DataRequest {
         let mut in_memory_row_group = InMemoryRowGroup {
             row_count,
             column_chunks,
-            offset_index: get_offset_index(parquet_metadata, row_group_idx),
+            page_index_provider,
             row_group_idx,
             metadata: parquet_metadata,
         };
@@ -122,6 +123,8 @@ pub(super) struct DataRequestBuilder<'a> {
     batch_size: usize,
     /// The parquet metadata
     parquet_metadata: &'a ParquetMetaData,
+    /// The source of page indexes
+    page_index_provider: &'a dyn PageIndexProvider,
     /// The projection mask (which columns to read)
     projection: &'a ProjectionMask,
     /// Optional row selection to apply
@@ -140,6 +143,7 @@ impl<'a> DataRequestBuilder<'a> {
         row_count: usize,
         batch_size: usize,
         parquet_metadata: &'a ParquetMetaData,
+        page_index_provider: &'a dyn PageIndexProvider,
         projection: &'a ProjectionMask,
     ) -> Self {
         Self {
@@ -147,6 +151,7 @@ impl<'a> DataRequestBuilder<'a> {
             row_count,
             batch_size,
             parquet_metadata,
+            page_index_provider,
             projection,
             selection: None,
             cache_projection: None,
@@ -184,6 +189,7 @@ impl<'a> DataRequestBuilder<'a> {
             row_count,
             batch_size,
             parquet_metadata,
+            page_index_provider,
             projection,
             selection,
             cache_projection,
@@ -202,7 +208,7 @@ impl<'a> DataRequestBuilder<'a> {
         let row_group = InMemoryRowGroup {
             row_count,
             column_chunks,
-            offset_index: get_offset_index(parquet_metadata, row_group_idx),
+            page_index_provider,
             row_group_idx,
             metadata: parquet_metadata,
         };
@@ -219,15 +225,4 @@ impl<'a> DataRequestBuilder<'a> {
             page_start_offsets,
         }
     }
-}
-
-fn get_offset_index(
-    parquet_metadata: &ParquetMetaData,
-    row_group_idx: usize,
-) -> Option<&[OffsetIndexMetaData]> {
-    parquet_metadata
-        .offset_index()
-        // filter out empty offset indexes (old versions specified Some(vec![]) when no present)
-        .filter(|index| !index.is_empty())
-        .map(|x| x[row_group_idx].as_slice())
 }
